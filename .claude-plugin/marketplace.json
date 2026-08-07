@@ -1,0 +1,15 @@
+{
+  "name": "stratx",
+  "description": "Tools for grounded research: answers whose every claim resolves to the exact source sentence, with unsupported claims reported rather than hidden.",
+  "owner": {
+    "name": "janmejai2002",
+    "url": "https://github.com/janmejai2002"
+  },
+  "plugins": [
+    {
+      "name": "stratx",
+      "source": "./",
+      "description": "Grounded research with verifiable citations - claims carry exact source spans, and what could not be supported is reported rather than smoothed over."
+    }
+  ]
+}

@@ -1,0 +1,401 @@
+#!/usr/bin/env node
+'use strict';
+
+const fs = require('fs');
+const path = require('path');
+
+const config = require('../lib/config');
+const corpus = require('../lib/corpus');
+const ground = require('../lib/ground');
+const run = require('../lib/run');
+const ledger = require('../lib/ledger');
+
+const CWD = process.cwd();
+const argv = process.argv.slice(2);
+
+const FLAGS = {};
+const ARGS = [];
+for (let i = 0; i < argv.length; i++) {
+  const a = argv[i];
+  if (a.startsWith('--')) {
+    const eq = a.indexOf('=');
+    if (eq > -1) FLAGS[a.slice(2, eq)] = a.slice(eq + 1);
+    else if (argv[i + 1] && !argv[i + 1].startsWith('--')) FLAGS[a.slice(2)] = argv[++i];
+    else FLAGS[a.slice(2)] = true;
+  } else ARGS.push(a);
+}
+
+const JSONOUT = !!FLAGS.json;
+const C = {
+  dim: s => (process.stdout.isTTY ? `\x1b[2m${s}\x1b[0m` : s),
+  b: s => (process.stdout.isTTY ? `\x1b[1m${s}\x1b[0m` : s),
+  g: s => (process.stdout.isTTY ? `\x1b[32m${s}\x1b[0m` : s),
+  y: s => (process.stdout.isTTY ? `\x1b[33m${s}\x1b[0m` : s),
+  r: s => (process.stdout.isTTY ? `\x1b[31m${s}\x1b[0m` : s),
+};
+
+function out(obj, human) {
+  if (JSONOUT) console.log(JSON.stringify(obj, null, 2));
+  else human();
+}
+
+function die(msg, code = 1) {
+  if (JSONOUT) console.log(JSON.stringify({ ok: false, error: String(msg) }, null, 2));
+  else console.error(C.r('error: ') + msg);
+  process.exit(code);
+}
+
+const USAGE = `stratx - grounded research with verifiable citations
+
+  stratx doctor                    check the environment and the API key
+  stratx init                      create the .stratx workspace here
+  stratx config [key] [value]      read or set configuration
+  stratx config set-key            store an API key (prompted, not echoed)
+
+  stratx ingest <file|folder>      add sources to the local corpus
+  stratx sources                   list ingested sources
+  stratx ask "<question>"          grounded answer with exact source spans
+  stratx show <query-id>           full stored record for a previous answer
+
+  stratx run new "<goal>"          start a phased engagement
+  stratx run list                  list runs
+  stratx run next                  what to do next, and what is blocking it
+  stratx run start <phase>         begin a phase (refuses if unmet prerequisite)
+  stratx run commit <phase>        commit a phase artifact, unlocking the next
+
+  stratx ledger                    token and cost totals, per phase
+
+  --json                           machine-readable output on any command
+  --workspace <dir>                override the workspace location
+`;
+
+async function main() {
+  if (FLAGS.workspace) process.env.STRATX_WORKSPACE = String(FLAGS.workspace);
+  const cmd = ARGS[0];
+
+  if (!cmd || cmd === 'help' || FLAGS.help) return console.log(USAGE);
+  if (cmd === 'version' || FLAGS.version) {
+    const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '.claude-plugin', 'plugin.json'), 'utf8'));
+    return console.log(pkg.version);
+  }
+
+  switch (cmd) {
+    case 'doctor':   return doctor();
+    case 'init':     return init();
+    case 'config':   return configCmd();
+    case 'ingest':   return ingestCmd();
+    case 'sources':  return sourcesCmd();
+    case 'ask':
+    case 'query':    return askCmd();
+    case 'show':     return showCmd();
+    case 'run':      return runCmd();
+    case 'ledger':   return ledgerCmd();
+    default:         return die(`unknown command "${cmd}"\n\n${USAGE}`);
+  }
+}
+
+// ---------------------------------------------------------------- doctor
+
+function doctor() {
+  const p = config.paths(CWD);
+  const auth = config.resolveKey(CWD);
+  const cfg = config.readConfig(CWD);
+  const manifest = corpus.loadManifest(CWD);
+  const nodeOk = Number(process.versions.node.split('.')[0]) >= 18;
+
+  const checks = [
+    { name: 'Node >= 18 (needs built-in fetch)', ok: nodeOk, detail: `v${process.versions.node}` },
+    { name: 'Workspace', ok: fs.existsSync(p.root), detail: p.root },
+    { name: 'API key', ok: !!auth, detail: auth ? `${auth.provider} (from ${auth.source})` : 'not found' },
+    { name: 'Model', ok: true, detail: auth ? config.resolveModel(CWD, auth.provider) : '(needs key)' },
+    { name: 'Grounding backend', ok: true, detail: cfg.grounding },
+    { name: 'Corpus', ok: Object.keys(manifest).length > 0, detail: `${Object.keys(manifest).length} sources` },
+  ];
+  const ok = checks.every(c => c.ok);
+
+  out({ ok, checks, workspace: p.root }, () => {
+    console.log(C.b('\nstratx doctor\n'));
+    for (const c of checks) {
+      console.log(`  ${c.ok ? C.g('ok  ') : C.y('todo')}  ${c.name.padEnd(34)} ${C.dim(c.detail)}`);
+    }
+    console.log('');
+    if (!fs.existsSync(p.root)) console.log(C.dim('  next: stratx init'));
+    else if (!auth) console.log(C.dim('  next: stratx config set-key'));
+    else if (Object.keys(manifest).length === 0) console.log(C.dim('  next: stratx ingest <file-or-folder>'));
+    else console.log(C.dim('  ready: stratx ask "your question"'));
+    console.log('');
+  });
+}
+
+// ---------------------------------------------------------------- init
+
+function init() {
+  const p = config.ensureWorkspace(CWD);
+  if (!fs.existsSync(p.config)) config.writeConfig(CWD, {});
+  out({ ok: true, workspace: p.root }, () => {
+    console.log(`${C.g('created')} ${p.root}`);
+    console.log(C.dim('  corpus/  index/  spans/  runs/  vault/'));
+    console.log(C.dim('\n  next: stratx config set-key'));
+  });
+}
+
+// ---------------------------------------------------------------- config
+
+function configCmd() {
+  const sub = ARGS[1];
+
+  if (sub === 'set-key') {
+    const fromFlag = FLAGS.key && typeof FLAGS.key === 'string' ? FLAGS.key : null;
+    if (fromFlag) {
+      config.writeConfig(CWD, { api_key: fromFlag });
+      try { fs.chmodSync(config.paths(CWD).config, 0o600); } catch { /* windows */ }
+      return out({ ok: true, provider: config.detectProvider(fromFlag) }, () =>
+        console.log(`${C.g('stored')} ${config.detectProvider(fromFlag)} key in ${config.paths(CWD).config}`)
+      );
+    }
+    return promptHidden('Paste API key (input hidden): ').then(key => {
+      if (!key || !key.trim()) return die('no key entered');
+      config.writeConfig(CWD, { api_key: key.trim() });
+      try { fs.chmodSync(config.paths(CWD).config, 0o600); } catch { /* windows */ }
+      console.log(`${C.g('stored')} ${config.detectProvider(key.trim())} key`);
+      console.log(C.dim(`  ${config.paths(CWD).config} (gitignored)`));
+    });
+  }
+
+  if (sub === 'set') {
+    const [, , key, ...rest] = ARGS;
+    if (!key) return die('usage: stratx config set <key> <value>');
+    let value = rest.join(' ');
+    if (/^\d+(\.\d+)?$/.test(value)) value = Number(value);
+    const next = config.writeConfig(CWD, { [key]: value });
+    return out({ ok: true, config: redact(next) }, () => console.log(`${C.g('set')} ${key} = ${value}`));
+  }
+
+  const cfg = redact(config.readConfig(CWD));
+  if (sub) {
+    return out({ [sub]: cfg[sub] }, () => console.log(String(cfg[sub] === undefined ? '' : cfg[sub])));
+  }
+  return out(cfg, () => {
+    console.log(C.b('\nconfig') + C.dim(`  ${config.paths(CWD).config}\n`));
+    for (const [k, v] of Object.entries(cfg)) console.log(`  ${k.padEnd(20)} ${C.dim(String(v))}`);
+    console.log('');
+  });
+}
+
+function redact(cfg) {
+  const c = { ...cfg };
+  if (c.api_key) c.api_key = c.api_key.slice(0, 7) + '…' + c.api_key.slice(-4);
+  return c;
+}
+
+function promptHidden(question) {
+  return new Promise(resolve => {
+    process.stdout.write(question);
+    const stdin = process.stdin;
+    if (!stdin.isTTY) {
+      let data = '';
+      stdin.on('data', d => (data += d));
+      stdin.on('end', () => resolve(data.trim()));
+      return;
+    }
+    stdin.setRawMode(true);
+    stdin.resume();
+    let buf = '';
+    stdin.on('data', function onData(ch) {
+      const s = ch.toString('utf8');
+      if (s === '\r' || s === '\n' || s === '\u0004') {
+        stdin.setRawMode(false);
+        stdin.pause();
+        stdin.removeListener('data', onData);
+        process.stdout.write('\n');
+        return resolve(buf);
+      }
+      if (s === '\u0003') { process.stdout.write('\n'); process.exit(130); }
+      if (s === '\u007f' || s === '\b') { buf = buf.slice(0, -1); return; }
+      buf += s;
+    });
+  });
+}
+
+// ---------------------------------------------------------------- corpus
+
+function ingestCmd() {
+  const target = ARGS[1];
+  if (!target) return die('usage: stratx ingest <file-or-folder>');
+  if (!fs.existsSync(target)) return die(`no such path: ${target}`);
+
+  const res = corpus.ingest(CWD, target);
+  out({ ok: true, ...res }, () => {
+    console.log(`${C.g('ingested')} ${res.sources.length} file(s), ${res.chunks} chunks`);
+    for (const s of res.sources.slice(0, 12)) {
+      console.log(`  ${C.dim(s.id)}  ${s.title.slice(0, 62)} ${C.dim(`(${s.chunks} chunks)`)}`);
+    }
+    if (res.sources.length > 12) console.log(C.dim(`  … and ${res.sources.length - 12} more`));
+    console.log(C.dim(`\n  corpus now holds ${res.total_sources} sources`));
+    console.log(C.dim('  next: stratx ask "your question"'));
+  });
+}
+
+function sourcesCmd() {
+  const manifest = corpus.loadManifest(CWD);
+  const rows = Object.values(manifest);
+  out(rows, () => {
+    if (!rows.length) return console.log(C.dim('no sources yet — stratx ingest <file-or-folder>'));
+    console.log(C.b(`\n${rows.length} source(s)\n`));
+    for (const s of rows) {
+      console.log(`  ${C.dim(s.id)}  ${s.title.slice(0, 58).padEnd(58)} ${C.dim(`${s.chunks} chunks`)}`);
+    }
+    console.log('');
+  });
+}
+
+// ---------------------------------------------------------------- ask
+
+async function askCmd() {
+  const question = ARGS.slice(1).join(' ').trim();
+  if (!question) return die('usage: stratx ask "<question>"');
+
+  const res = await ground.query(CWD, question, {
+    run: FLAGS.run || null,
+    phase: FLAGS.phase || 'ground',
+    k: FLAGS.k ? Number(FLAGS.k) : undefined,
+  });
+
+  out(res, () => {
+    const full = ground.load(CWD, res.id);
+    console.log('');
+    if (full.answer_md) console.log(full.answer_md.trim() + '\n');
+
+    if (full.claims.length) {
+      console.log(C.b('claims'));
+      for (const c of full.claims) {
+        const mark = c.state === 'supported' ? C.g('✓') : C.y('?');
+        console.log(`  ${mark} ${c.text}`);
+        const ev = c.evidence.find(e => e.quote);
+        if (ev) {
+          console.log(C.dim(`      "${ev.quote.slice(0, 150)}"`));
+          console.log(C.dim(`      ${ev.title} · chars ${ev.char_start}-${ev.char_end}`));
+        }
+      }
+      console.log('');
+    }
+
+    if (full.unsupported.length) {
+      console.log(C.y('could not support'));
+      for (const u of full.unsupported) {
+        console.log(`  · ${u.text}`);
+        if (u.searched_for) console.log(C.dim(`      looked for: ${u.searched_for}`));
+      }
+      console.log('');
+    }
+
+    console.log(C.dim(
+      `${res.claims_supported}/${res.claims_total} claims with spans · ` +
+      `${res.unsupported} unsupported · ${res.sources} sources · ` +
+      `$${res.cost_usd.toFixed(4)} · ${res.id}`
+    ));
+    console.log('');
+  });
+}
+
+function showCmd() {
+  const id = ARGS[1];
+  if (!id) return die('usage: stratx show <query-id>');
+  let full;
+  try { full = ground.load(CWD, id); } catch { return die(`no stored answer with id ${id}`); }
+  out(full, () => console.log(JSON.stringify(full, null, 2)));
+}
+
+// ---------------------------------------------------------------- run
+
+function runCmd() {
+  const sub = ARGS[1];
+
+  if (sub === 'new') {
+    const goal = ARGS.slice(2).join(' ').trim();
+    if (!goal) return die('usage: stratx run new "<goal>"');
+    const r = run.create(CWD, goal);
+    return out(r, () => {
+      console.log(`${C.g('run')} ${r.id}  ${C.dim(r.goal)}`);
+      console.log(C.dim(`  ${run.runDir(CWD, r.id)}`));
+      console.log(C.dim('  next: stratx run next'));
+    });
+  }
+
+  if (sub === 'list') {
+    const rows = run.list(CWD);
+    return out(rows, () => {
+      if (!rows.length) return console.log(C.dim('no runs yet'));
+      console.log('');
+      for (const r of rows) {
+        const done = Object.values(r.phases).filter(p => p.state === 'committed').length;
+        console.log(`  ${C.b(r.id)}  ${String(r.goal).slice(0, 52).padEnd(52)} ${C.dim(`${done}/${run.PHASES.length} phases`)}`);
+      }
+      console.log('');
+    });
+  }
+
+  if (sub === 'next' || sub === 'status') {
+    const n = run.next(CWD, FLAGS.run || ARGS[2]);
+    return out(n, () => {
+      const r = run.load(CWD, n.run);
+      console.log(C.b(`\nrun ${r.id}`) + `  ${C.dim(r.goal)}\n`);
+      for (const def of run.PHASES) {
+        const st = r.phases[def.name];
+        const mark = st.state === 'committed' ? C.g('✓') : st.state === 'running' ? C.y('●') : C.dim('·');
+        const label = st.state === 'committed' ? C.dim(def.name) : def.name;
+        console.log(`  ${mark} ${label.padEnd(22)} ${C.dim(st.artifact || def.produces)}`);
+      }
+      console.log('');
+      if (n.next_phase) {
+        console.log(`  ${C.b('next')}  ${n.next_phase} — ${n.what}`);
+        if (n.blocked_by) console.log(`  ${C.y('blocked')} until "${n.blocked_by}" commits its artifact`);
+        console.log(C.dim(`  artifact expected at ${n.expected_artifact}`));
+      } else console.log(`  ${C.g('complete')}`);
+      console.log(C.dim(`\n  spend $${n.spend.cost_usd.toFixed(4)} · ${n.spend.calls} calls · ${n.spend.tokens} tokens\n`));
+    });
+  }
+
+  if (sub === 'start') {
+    const phase = ARGS[2];
+    if (!phase) return die(`usage: stratx run start <phase>   (${run.PHASE_NAMES.join(', ')})`);
+    const r = run.start(CWD, FLAGS.run || null, phase);
+    return out(r, () => console.log(`${C.y('●')} started ${phase} ${C.dim(`in run ${r.id}`)}`));
+  }
+
+  if (sub === 'commit') {
+    const phase = ARGS[2];
+    if (!phase) return die(`usage: stratx run commit <phase> [--artifact <path>]`);
+    const r = run.commit(CWD, FLAGS.run || null, phase, FLAGS.artifact || null);
+    return out(r, () => {
+      console.log(`${C.g('✓')} committed ${phase} ${C.dim(r.phases[phase].artifact)}`);
+      if (r.state === 'complete') console.log(C.g('  run complete'));
+      else console.log(C.dim(`  unlocked: ${r.current_phase}`));
+    });
+  }
+
+  return die(`usage: stratx run <new|list|next|start|commit>`);
+}
+
+// ---------------------------------------------------------------- ledger
+
+function ledgerCmd() {
+  const t = ledger.totals(CWD, FLAGS.run || null);
+  out(t, () => {
+    console.log(C.b('\nspend') + C.dim(FLAGS.run ? `  run ${FLAGS.run}` : '  all runs') + '\n');
+    console.log(`  calls           ${t.calls}`);
+    console.log(`  input tokens    ${t.input_tokens.toLocaleString()}`);
+    console.log(`  output tokens   ${t.output_tokens.toLocaleString()}`);
+    console.log(`  estimated cost  $${t.cost_usd.toFixed(4)}`);
+    const phases = Object.entries(t.by_phase);
+    if (phases.length) {
+      console.log(C.dim('\n  by phase'));
+      for (const [ph, v] of phases) {
+        console.log(`    ${ph.padEnd(14)} ${String(v.tokens).padStart(9)} tok   $${v.cost_usd.toFixed(4)}`);
+      }
+    }
+    console.log('');
+  });
+}
+
+main().catch(err => die(err && err.message ? err.message : String(err)));

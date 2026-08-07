@@ -1,0 +1,12 @@
+# stratx workspaces are per-project runtime state, never committed
+.stratx/
+
+# local env
+.env
+.env.*
+
+node_modules/
+*.log
+
+.DS_Store
+Thumbs.db

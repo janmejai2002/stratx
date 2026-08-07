@@ -1,0 +1,40 @@
+{
+  "name": "stratx",
+  "description": "Grounded research with verifiable citations. Runs a phased research engagement over a local corpus, emits claims with exact source spans, and flags what it could not support.",
+  "version": "0.1.0",
+  "author": {
+    "name": "janmejai2002"
+  },
+  "homepage": "https://github.com/janmejai2002/stratx",
+  "repository": "https://github.com/janmejai2002/stratx",
+  "license": "MIT",
+  "keywords": ["research", "citations", "grounding", "provenance", "notebooklm"],
+  "userConfig": {
+    "api_key": {
+      "type": "string",
+      "title": "API key",
+      "description": "An OpenRouter key (sk-or-...) or an Anthropic key (sk-ant-...). Detected automatically. Used only for reasoning and verification - indexing and retrieval are local and free.",
+      "sensitive": true,
+      "required": true
+    },
+    "model": {
+      "type": "string",
+      "title": "Model",
+      "description": "Model id for grounded answers. Leave blank for a sensible default per provider.",
+      "default": ""
+    },
+    "grounding": {
+      "type": "string",
+      "title": "Grounding backend",
+      "description": "local (default, no external setup) or notebooklm (requires the notebooklm MCP and 'nlm login').",
+      "default": "local"
+    },
+    "spend_cap_usd": {
+      "type": "number",
+      "title": "Spend cap (USD)",
+      "description": "Soft ceiling per run. stratx stops and asks before exceeding it.",
+      "default": 5,
+      "min": 0
+    }
+  }
+}

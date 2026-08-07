@@ -1,0 +1,9 @@
+# Keep LF in the repository for everything text.
+* text=auto eol=lf
+
+# bin/stratx carries a shebang: CRLF here breaks execution on macOS and Linux
+# with "bad interpreter". Never let it be converted.
+bin/stratx text eol=lf
+
+# The Windows shim is the one file that genuinely wants CRLF.
+bin/*.cmd text eol=crlf
