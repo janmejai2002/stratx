@@ -1,0 +1,88 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: node ${{ matrix.node }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # The portability claim in the README is only true if it is tested.
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node: ['18', '20', '22']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Span fidelity tests
+        run: node --test test/spans.test.js
+
+      - name: CLI loads and reports version
+        run: node bin/stratx version
+
+      - name: Cold start works with no config
+        shell: bash
+        run: |
+          mkdir -p /tmp/stratx-ci && cd /tmp/stratx-ci
+          mkdir -p docs
+          printf '# Notes\n\nThe threshold rose to 40 percent for the 2027 compliance year.\n' > docs/n.md
+          node "$GITHUB_WORKSPACE/bin/stratx" init
+          node "$GITHUB_WORKSPACE/bin/stratx" ingest docs
+          node "$GITHUB_WORKSPACE/bin/stratx" sources --json
+          # doctor exits non-zero only on hard failure; no API key is set here,
+          # so this asserts the tool degrades gracefully rather than crashing.
+          node "$GITHUB_WORKSPACE/bin/stratx" doctor --json
+
+      - name: Phase machine refuses to skip a prerequisite
+        shell: bash
+        run: |
+          cd /tmp/stratx-ci
+          node "$GITHUB_WORKSPACE/bin/stratx" run new "ci check"
+          if node "$GITHUB_WORKSPACE/bin/stratx" run start execute 2>/dev/null; then
+            echo "FAIL: phase machine allowed a skip"; exit 1
+          else
+            echo "ok: prerequisite enforced"
+          fi
+
+  validate:
+    name: plugin manifest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Manifest is valid JSON and well formed
+        run: |
+          node -e "
+            const fs = require('fs');
+            const p = JSON.parse(fs.readFileSync('.claude-plugin/plugin.json','utf8'));
+            const m = JSON.parse(fs.readFileSync('.claude-plugin/marketplace.json','utf8'));
+            for (const k of ['name','description','version']) {
+              if (!p[k]) throw new Error('plugin.json missing ' + k);
+            }
+            if (!Array.isArray(m.plugins) || !m.plugins.length) {
+              throw new Error('marketplace.json has no plugins');
+            }
+            console.log('plugin', p.name, p.version, 'ok');
+          "
+      - name: Every skill has frontmatter with a description
+        run: |
+          node -e "
+            const fs = require('fs');
+            for (const d of fs.readdirSync('skills')) {
+              const f = 'skills/' + d + '/SKILL.md';
+              const s = fs.readFileSync(f, 'utf8');
+              if (!/^---[\s\S]*?description:[\s\S]*?---/.test(s)) {
+                throw new Error(f + ' missing description frontmatter');
+              }
+              console.log(d, 'ok');
+            }
+          "
